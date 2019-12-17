@@ -1,0 +1,246 @@
+```{r setup}
+library(tidyr)
+library(readr)
+library(stringr)
+library(glptools)
+
+library(tesseract)
+library(pdftools)
+library(imager)
+library(magick)
+
+library(purrr)
+library(furrr)
+library(tictoc) #Using this to measure efficiency of furrr vs. purr
+library(hocr)   #https://github.com/dmi3kno/hocr
+```
+
+# Create image file data frame
+
+Each line of the image file index contains 11 information columns followed by a list of all the image file names (up to 1517). 
+This code reads in the index file in its current format using 1528 columns.
+The ID columns are renames, then the data frame is transformed to long format. The first image file is retained.
+Future analysis might make use of other image files than just the first one.
+```{r image_index}
+# Read in the file
+images <- read_csv("irs.2017_12_PF.dat.txt",
+                 col_names = paste0("X", 1:1528))
+
+# Rename the information columns
+images %<>%
+  rename(
+    a = X1,
+    paper_or_electronic = X2,
+    EIN = X3,
+    date_of_form = X4,
+    name = X5,
+    state = X6,
+    zip_code = X7,
+    form = X8,
+    num_ = X9,
+    num2 = X10,
+    date_uploaded = X11) %>%
+  pivot_longer(X12:X1528, names_to = "file", values_to = "image_name") %>%
+  filter(!is.na(name)) %>%
+  mutate(image_name = str_sub(image_name, 4, 15)) %>%
+  filter(form == "990PF") %>%
+  group_by(EIN) %>%
+  summarise(image_name = first(image_name))
+
+# Rename image paths to the proper file location 
+images %<>% mutate(image_name = "../../../990_files/" %p% image_name)
+
+
+# PDF file info
+#PDFs <- read_csv("htaccess.2017_12_PF.txt",
+#                 col_names = FALSE)
+
+#Create long data frame linking images to PDFs
+
+#purrr::walk(images$image_name, 
+#            function(x) file.copy(paste0("2017_12_PF_01/", x), 
+#                                  "2017_12_PF_01_2"))
+
+#all_pdfs <- list.files(path %p% "IRS990-2017_12_PF/2017_12_PF")
+#all_pdfs %<>% paste0(path, "IRS990-2017_12_PF/2017_12_PF/", .)
+
+getwd()
+```
+
+# Read in image file as text
+
+Use OCR to read in images using furrr and transform them to a data frame using hocr
+tictoc can be removed--I use it to estimate the amount of time things will take. (At least 10 minutes for 1000 images.)
+
+```{r ocr}
+plan(multiprocess)
+
+tic()
+ocr_text <- future_map(images$image_name[1:1000], 
+                       ~ocr(., HOCR = T, tesseract(options = list(tessedit_pageseg_mode = 1,
+                                                                  language_model_penalty_non_dict_word = 1))), 
+                       .progress = TRUE)
+toc()
+
+ocr_text %<>% future_map(hocr_parse)
+ocr_text %<>% future_map_dfr(tidy_tesseract, .id = "image")
+
+# copy OCR data frame
+backup <- ocr_text
+```
+
+# Find grants number
+
+Currently exploring the data and methods of finding the grants data, some of which are below.
+Origial idea was to cluster the text coordinates to find the same text across pages.
+Current idea is to identify the text label "Contributions, gifts, and grants" and simply look to the right (using x,y coordinates)
+to find the proper numbers. (Note that the text appears twice on the 990PF--line 1 and line 25)
+
+Might digitize other numbers to act as a check, since numbers on the front page should add/subtract to totals.
+
+
+```{r process_ocr}
+# Find line containing "Contributions, gifts, and grants"
+test <- ocr_text %>%
+  filter(str_detect(ocrx_word_value, "Contributions|gifts|grants")) %>%
+  group_by(image, ocrx_word_value) %>%
+  mutate(num_word = n()) %>%
+  filter(num_word == max(num_word)) %>%
+  ungroup() %>%
+  group_by(image) %>%
+  summarise(grants_line = last(ocr_line_id))
+
+
+```
+
+```{r eval=FALSE}
+
+# TESSERACT ENGINE
+
+# List tesseract engine parameters
+params <- tesseract_params()
+
+# Subset to page segmentation parameters
+# See https://github.com/tesseract-ocr/tesseract/wiki/ImproveQuality#page-segmentation-method
+params <- params[str_detect(params$param, "seg"),] 
+
+
+
+# OCR DATA EXPLORATION
+
+# Calculate number of words found per image
+ocr_text %>% 
+  group_by(image) %>% 
+  summarise(n = n()) %>%
+  pull(n) %>% 
+  base::summary()
+
+
+# Find line containing "Contributions, gifts, and grants"
+# Filter ocr_text to that line
+test <- ocr_text %>%
+  filter(str_detect(ocrx_word_value, "Contributions|gifts|grants")) %>%
+  group_by(image, ocrx_word_value) %>%
+  mutate(num_word = n()) %>%
+  filter(num_word == max(num_word)) %>%
+  ungroup() %>%
+  group_by(image) %>%
+  summarise(grants_line = last(ocr_line_id))
+
+test <- ocr_text %>%
+  left_join(test, by = "image") %>%
+  filter(ocr_line_id == grants_line)
+
+
+# Find number of images containing "Contributions", "gifts", or "grants"
+text <- ocr_text %>%  
+  summarise(
+    line_num1 = ocr_line_id[any(str_detect(ocrx_word_value, "Contributions")),],
+    line_num2 = ocr_line_id[any(str_detect(ocrx_word_value, "gifts")),],
+    line_num3 = ocr_line_id[any(str_detect(ocrx_word_value, "grants")),])
+
+
+# Group together text based on bounding boxes and kmeans
+test <- str_split(ocr_text$ocrx_word_bbox, " ", simplify = TRUE) %>% 
+  as.data.frame(stringsAsFactors = F) %>%
+  rename(x1 = V1, y1 = V2, x2 = V3, y2 = V4) %>%
+  mutate_all(as.numeric) %>%
+  kmeans(725)
+
+```
+
+Old code--I was playing around with plotting bounding boxes on the 990 and with edge detection
+```{r, eval=FALSE}
+library(OpenImageR)
+
+library(ggplot2)
+
+p1 <- text %>%
+  mutate(ocrx_word_bbox=lapply(ocrx_word_bbox, function(x)
+    separate(as_tibble(x), value, into=c("word_x1", "word_y1", "word_x2", "word_y2"), convert = TRUE))) %>%
+  unnest(ocrx_word_bbox) %>%
+  mutate(ocr_page_bbox=lapply(ocr_page_bbox, function(x)
+    separate(as_tibble(x), value, into=c("page_x1", "page_y1", "page_x2", "page_y2"), convert = TRUE))) %>%
+  unnest(ocr_page_bbox) %>%
+  mutate(word_y1=max(page_y2)-word_y1,
+         word_y2=max(page_y2)-word_y2) %>%
+  ggplot(aes(xmin=word_x1, ymin=word_y1, xmax=word_x2, ymax=word_y2))+
+  geom_rect(aes(color=ocr_par_id, fill=ocrx_word_conf), show.legend = TRUE)+
+  theme_minimal()+
+  theme(panel.grid = element_blank(),
+        axis.text = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 7))
+
+test3 <- as.cimg.raster(test2)
+
+p2 <- grid::rasterGrob(test3, interpolate=TRUE)
+
+p1
+
+image_ggplot
+
+im1 = readImage(path %p% "IRS990-2017_12_PF/2017_12_PF_01/" %p% images$image_name[1], native = TRUE)
+im2 = readImage(path %p% "IRS990-2017_12_PF/2017_12_PF_01/" %p% images$image_name[1], convert = TRUE)
+
+edsc = edge_detection(im2, method = 'Scharr', conv_mode = 'same')
+
+imageShow(edsc)
+
+
+res_slic = superpixels(input_image = im1,
+                       method = "slico",
+                       superpixel = 200,
+                       compactness = 20,
+                       return_slic_data = TRUE,
+                       return_labels = TRUE,
+                       write_slic = "",
+                       verbose = TRUE)
+
+
+for(bbox in 1:483) {
+
+  print(bbox)
+
+  this_line <- p1[bbox,]
+
+  test2 <- draw_rect(test2, this_line$word_x1, this_line$word_y1, this_line$word_x2, this_line$word_y2,
+                     color = "black", opacity = 1, filled = F)
+}
+
+
+draw_rect <- function (im, x0, y0, x1, y1, color = "white", opacity = 1, filled = TRUE) {
+  if (is.character(color)) {
+    color <- col2rgb(color)[, 1]/255
+  }
+  ls <- purrr::map_int(c(x0, y0, x1, y1), length)
+  if (min(ls) != max(ls))
+    stop("x0,y0,x1,y1 must be the same length")
+  imager:::draw_rect_(im, x0, y0, x1, y1, color, opacity, filled)
+}
+
+plot(test2)
+```
+
+
+
